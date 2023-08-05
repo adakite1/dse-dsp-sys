@@ -32,7 +32,7 @@ fn to_16bit_pcm_audio(orig: &f64) -> i16 {
     (orig * 32768.0).round() as i16
 }
 
-pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rate: f64, samples_per_block: usize) -> usize {
+pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rate: f64, samples_per_block: usize, loop_start_i16: usize) -> usize {
     // Resampler expects floating point samples. Convert.
     let mut samples_f64: Vec<f64> = samples.into_iter().map(to_f64_audio).collect();
     // Resample to target sample rate.
@@ -54,11 +54,13 @@ pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rat
     }
     average_delta /= 8;
     let mut samples_adpcm: Vec<u8> = Vec::new();
+    let mut loop_start_adpcm = 0;
     unsafe {
         let adpcmctx = adpcm_create_context(1, 3, 2, &mut average_delta as *mut i32);
         {
             let mut block_size = (samples_per_block - 1) / 2 + 4;
-            for chunk in samples.chunks(samples_per_block).into_iter() {
+            let block_size_static = block_size;
+            for (i, chunk) in samples.chunks(samples_per_block).into_iter().enumerate() {
                 let mut this_block_adpcm_samples = samples_per_block; // For when the file doesn't end on a full block, extra configuration is needed
                 let mut this_block_pcm_samples = samples_per_block;
 
@@ -94,10 +96,17 @@ pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rat
 
                 // Do something with the adpcm_block
                 samples_adpcm.extend_from_slice(&adpcm_block);
+
+                // See if the loop start falls within this chunk
+                if loop_start_i16 >= i * samples_per_block && loop_start_i16 < (i+1) * samples_per_block {
+                    // If it does, the loop_start is within this chunk as well but its index would've been changed by the encoding process. Recalculate the new index and return it later
+                    let index_in_this_chunk = loop_start_i16 - i * samples_per_block;
+                    loop_start_adpcm = i * block_size_static + 4 + index_in_this_chunk / 2;
+                }
             }
             // adpcm_encode_block(adpcmctx, outbuf, outbufsize, inbuf, inbufcount);
         }
         adpcm_free_context(adpcmctx);
     }
-    0
+    loop_start_adpcm
 }
