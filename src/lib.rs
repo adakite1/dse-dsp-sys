@@ -32,7 +32,7 @@ fn to_16bit_pcm_audio(orig: &f64) -> i16 {
     (orig * 32768.0).round() as i16
 }
 
-pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rate: f64, samples_per_block: usize, loop_start_i16: usize) -> usize {
+pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rate: f64, samples_per_block: usize, loop_start_i16: usize) -> (Vec<u8>, usize) {
     // Resampler expects floating point samples. Convert.
     let mut samples_f64: Vec<f64> = samples.into_iter().map(to_f64_audio).collect();
     // Resample to target sample rate.
@@ -108,5 +108,5 @@ pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rat
         }
         adpcm_free_context(adpcmctx);
     }
-    loop_start_adpcm
+    (samples_adpcm, loop_start_adpcm)
 }
