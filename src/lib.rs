@@ -32,20 +32,42 @@ fn to_16bit_pcm_audio(orig: &f64) -> i16 {
     (orig * 32768.0).round() as i16
 }
 
-pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rate: f64, samples_per_block: usize, loop_start_i16: usize) -> (Vec<u8>, usize) {
+pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rate: f64, samples_per_block: usize, mut loop_start_by_sample_point: usize) -> (Vec<u8>, usize) {
     // Resampler expects floating point samples. Convert.
     let mut samples_f64: Vec<f64> = samples.into_iter().map(to_f64_audio).collect();
     // Resample to target sample rate.
     unsafe {
         let resampler16 = resampler16_create(src_sample_rate, dest_sample_rate, samples_f64.len() as i32, 2.0);
-        let mut output_array_pointer: *mut c_double = null_mut();
-        let output_array_len = resampler16_process(resampler16, samples_f64.as_mut_ptr(), samples_f64.len() as i32, &mut output_array_pointer as *mut *mut c_double);
-        if let None = output_array_pointer.as_ref() {
-            panic!("Something happened during resampling!");
+        let resample = |resampler16: *mut HCDSPResampler16, samples_f64: &mut Vec<f64>| {
+            let mut output_array_pointer: *mut c_double = null_mut();
+            let output_array_len = resampler16_process(resampler16, samples_f64.as_mut_ptr(), samples_f64.len() as i32, &mut output_array_pointer as *mut *mut c_double);
+            if let None = output_array_pointer.as_ref() {
+                panic!("Something happened during resampling!");
+            }
+            std::slice::from_raw_parts(output_array_pointer, output_array_len as usize).iter().map(to_16bit_pcm_audio)
+        };
+        samples = resample(resampler16, &mut samples_f64).collect();
+        let max_len = resampler16_getMaxOutLen(resampler16, samples_f64.len() as i32) as usize;
+        while samples.len() < max_len {
+            samples.extend(resample(resampler16, &mut vec![0.0; samples_f64.len()])); // Flush the resampler
         }
-        samples = std::slice::from_raw_parts(output_array_pointer, output_array_len as usize).iter().map(to_16bit_pcm_audio).collect();
+        if samples.len() > max_len {
+            samples.resize(max_len, 0);
+        }
+        println!("LATENCY {} SIZE {} ACTUAL_SIZE {}", resampler16_getLatency(resampler16), max_len, samples.len());
         resampler16_destroy(resampler16);
     }
+    // let spec = hound::WavSpec{
+    //     channels: 1,
+    //     sample_rate: dest_sample_rate as u32,
+    //     bits_per_sample: 16,
+    //     sample_format: hound::SampleFormat::Int
+    // };
+    // let mut writer = hound::WavWriter::create("testr8brain.wav", spec).unwrap();
+    // samples.iter().for_each(|sample| writer.write_sample(*sample).unwrap());
+    //     writer.finalize().unwrap();
+    // Map the loop index to the new sample rate
+    loop_start_by_sample_point = (loop_start_by_sample_point as f64 * (dest_sample_rate / src_sample_rate)).round() as usize;
     // Encode samples with ADPCM
     let mut average_delta: i32 = 0;
     for i in (samples.len()-1)..0 {
@@ -98,9 +120,9 @@ pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rat
                 samples_adpcm.extend_from_slice(&adpcm_block);
 
                 // See if the loop start falls within this chunk
-                if loop_start_i16 >= i * samples_per_block && loop_start_i16 < (i+1) * samples_per_block {
+                if loop_start_by_sample_point >= i * samples_per_block && loop_start_by_sample_point < (i+1) * samples_per_block {
                     // If it does, the loop_start is within this chunk as well but its index would've been changed by the encoding process. Recalculate the new index and return it later
-                    let index_in_this_chunk = loop_start_i16 - i * samples_per_block;
+                    let index_in_this_chunk = loop_start_by_sample_point - i * samples_per_block;
                     loop_start_adpcm = i * block_size_static + 4 + index_in_this_chunk / 2;
                 }
             }
@@ -108,5 +130,6 @@ pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rat
         }
         adpcm_free_context(adpcmctx);
     }
+    // println!("{} {}", samples.len(), samples_adpcm.len());
     (samples_adpcm, loop_start_adpcm)
 }
