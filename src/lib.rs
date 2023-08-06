@@ -32,7 +32,7 @@ fn to_16bit_pcm_audio(orig: &f64) -> i16 {
     (orig * 32768.0).round() as i16
 }
 
-pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rate: f64, samples_per_block: usize, mut loop_start_by_sample_point: usize) -> (Vec<u8>, usize) {
+pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, samples_per_block: usize, mut loop_start_by_sample_point: usize) -> (Vec<u8>, usize) {
     // Resampler expects floating point samples. Convert.
     let mut samples_f64: Vec<f64> = samples.into_iter().map(to_f64_audio).collect();
     // Resample to target sample rate.
@@ -78,7 +78,7 @@ pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rat
     let mut samples_adpcm: Vec<u8> = Vec::new();
     let mut loop_start_adpcm = 0;
     unsafe {
-        let adpcmctx = adpcm_create_context(1, 3, 2, &mut average_delta as *mut i32);
+        let adpcmctx = adpcm_create_context(1, lookahead, 2, &mut average_delta as *mut i32);
         {
             let mut block_size = (samples_per_block - 1) / 2 + 4;
             let block_size_static = block_size;
