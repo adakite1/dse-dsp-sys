@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     cc::Build::new()
-        .file("adpcm-xq/adpcm-xq.c")
-        .file("adpcm-xq/adpcm-lib.c")
-        .compile("adpcm-xq");
+        .file("adpcm-xq-nds/adpcm-xq.c")
+        .file("adpcm-xq-nds/adpcm-lib.c")
+        .compile("adpcm-xq-nds");
     cc::Build::new()
         .cpp(true)
         .include(PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?).join("r8brain-free-src"))
