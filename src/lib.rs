@@ -32,7 +32,29 @@ fn to_16bit_pcm_audio(orig: &f64) -> i16 {
     (orig * 32768.0).round() as i16
 }
 
-pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, samples_per_block: usize, mut loop_start_by_sample_point: usize) -> (Vec<u8>, usize) {
+// Define our error types. These may be customized for our error handling cases.
+// Now we will be able to write our own errors, defer to an underlying error
+// implementation, or do something in between.
+#[derive(Debug, Clone)]
+pub struct TrackingError;
+
+impl std::error::Error for TrackingError {  }
+
+// Generation of an error is completely separate from how it is displayed.
+// There's no need to be concerned about cluttering complex logic with the display style.
+//
+// Note that we don't store any extra info about the errors. This means we can't state
+// which string failed to parse without modifying our types to carry that information.
+impl std::fmt::Display for TrackingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Failed to track one or more indices!")
+    }
+}
+
+pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, samples_per_block: usize, track_sample_points: &[usize]) -> (Vec<u8>, Result<Vec<usize>, TrackingError>) {
+    let mut tracked_sample_points: Vec<usize> = track_sample_points.into();
+    let mut tracked_to: Vec<Result<usize, TrackingError>> = vec![Err(TrackingError {  }); tracked_sample_points.len()];
+
     // Resampler expects floating point samples. Convert.
     let mut samples_f64: Vec<f64> = samples.into_iter().map(to_f64_audio).collect();
     // Resample to target sample rate.
@@ -66,8 +88,10 @@ pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rat
     // let mut writer = hound::WavWriter::create("testr8brain.wav", spec).unwrap();
     // samples.iter().for_each(|sample| writer.write_sample(*sample).unwrap());
     //     writer.finalize().unwrap();
-    // Map the loop index to the new sample rate
-    loop_start_by_sample_point = (loop_start_by_sample_point as f64 * (dest_sample_rate / src_sample_rate)).round() as usize;
+    // Map the tracked indices to the new sample rate
+    for tracked in tracked_sample_points.iter_mut() {
+        *tracked = (*tracked as f64 * (dest_sample_rate / src_sample_rate)).round() as usize;
+    }
     // Encode samples with ADPCM
     let mut average_delta: i32 = 0;
     for i in (samples.len()-1)..0 {
@@ -76,7 +100,6 @@ pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rat
     }
     average_delta /= 8;
     let mut samples_adpcm: Vec<u8> = Vec::new();
-    let mut loop_start_adpcm = 0;
     unsafe {
         let adpcmctx = adpcm_create_context(1, lookahead, 2, &mut average_delta as *mut i32);
         {
@@ -119,11 +142,13 @@ pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rat
                 // Do something with the adpcm_block
                 samples_adpcm.extend_from_slice(&adpcm_block);
 
-                // See if the loop start falls within this chunk
-                if loop_start_by_sample_point >= i * samples_per_block && loop_start_by_sample_point < (i+1) * samples_per_block {
-                    // If it does, the loop_start is within this chunk as well but its index would've been changed by the encoding process. Recalculate the new index and return it later
-                    let index_in_this_chunk = loop_start_by_sample_point - i * samples_per_block;
-                    loop_start_adpcm = i * block_size_static + 4 + index_in_this_chunk / 2;
+                // See if any of the tracked indices belong to this chunk
+                for (tracked, tracked_to) in tracked_sample_points.iter().zip(tracked_to.iter_mut()) {
+                    if *tracked >= i * samples_per_block && *tracked < (i+1) * samples_per_block {
+                        // If it does, the tracked index is within this chunk as well but its index would've been changed by the encoding process. Recalculate the new index and return it later
+                        let index_in_this_chunk = *tracked - i * samples_per_block;
+                        *tracked_to = Ok(i * block_size_static + 4 + index_in_this_chunk / 2);
+                    }
                 }
             }
             // adpcm_encode_block(adpcmctx, outbuf, outbufsize, inbuf, inbufcount);
@@ -131,5 +156,5 @@ pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rat
         adpcm_free_context(adpcmctx);
     }
     // println!("{} {}", samples.len(), samples_adpcm.len());
-    (samples_adpcm, loop_start_adpcm)
+    (samples_adpcm, tracked_to.into_iter().collect::<Result<Vec<usize>, TrackingError>>())
 }
