@@ -1,12 +1,6 @@
-use std::{ffi::{c_double, c_int, c_void}, ptr::null_mut};
+use std::{ffi::{c_double, c_int}, ptr::null_mut};
 
-// Bindings to the adpcm-xq encoder
-extern "C" {
-    pub fn adpcm_create_context(num_channels: c_int, lookahead: c_int, noise_shaping: c_int, initial_deltas: *mut i32) -> *mut c_void;
-    pub fn adpcm_encode_block(p: *mut c_void, outbuf: *mut u8, outbufsize: *mut usize, inbuf: *const i16, inbufcount: c_int) -> c_int;
-    pub fn adpcm_decode_block(outbuf: *mut i16, inbuf: *const u8, inbufsize: usize, channels: c_int) -> c_int;
-    pub fn adpcm_free_context(p: *mut c_void);
-}
+use adpcm_xq_sys::{adpcm_create_context, adpcm_encode_block, adpcm_free_context};
 
 // Bindings to the r8brain resampler
 #[repr(C)]
