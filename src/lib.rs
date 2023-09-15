@@ -91,6 +91,9 @@ pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rat
     // Map the tracked indices to the new sample rate
     for tracked in tracked_sample_points.iter_mut() {
         *tracked = (*tracked as f64 * (dest_sample_rate / src_sample_rate)).round() as usize;
+        if *tracked >= samples.len() {
+            *tracked = samples.len()-1;
+        }
     }
     // Encode samples with ADPCM
     let mut average_delta: i32 = 0;
