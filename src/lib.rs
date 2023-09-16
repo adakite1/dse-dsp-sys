@@ -150,41 +150,44 @@ pub fn encode_adpcm_mono_16bitpcm(samples: &[i16], lookahead: c_int, samples_per
 }
 
 pub fn resample_mono_16bitpcm(samples: &[i16], src_sample_rate: f64, dest_sample_rate: f64, track_sample_points: &[usize]) -> (Vec<i16>, Vec<usize>) {
-    let mut tracked_sample_points: Vec<usize> = track_sample_points.into();
-
-    // Resampler expects floating point samples. Convert.
-    let mut samples_f64: Vec<f64> = samples.iter().map(|&x| to_f64_audio(x)).collect();
-
-    // Resample to target sample rate.
-    let mut samples_processed: Vec<i16>;
-    unsafe {
-        let resampler16 = resampler16_create(src_sample_rate, dest_sample_rate, samples_f64.len() as i32, 2.0);
-        let resample = |resampler16: *mut HCDSPResampler16, samples_f64: &mut Vec<f64>| {
-            let mut output_array_pointer: *mut c_double = null_mut();
-            let output_array_len = resampler16_process(resampler16, samples_f64.as_mut_ptr(), samples_f64.len() as i32, &mut output_array_pointer as *mut *mut c_double);
-            if let None = output_array_pointer.as_ref() {
-                panic!("Something happened during resampling!");
-            }
-            std::slice::from_raw_parts(output_array_pointer, output_array_len as usize).iter().map(to_16bit_pcm_audio)
-        };
-        samples_processed = resample(resampler16, &mut samples_f64).collect();
-        let max_len = resampler16_getMaxOutLen(resampler16, samples_f64.len() as i32) as usize;
-        while samples.len() < max_len {
-            samples_processed.extend(resample(resampler16, &mut vec![0.0; samples_f64.len()])); // Flush the resampler
-        }
-        if samples.len() > max_len {
-            samples_processed.resize(max_len, 0);
-        }
-        println!("LATENCY {} SIZE {} ACTUAL_SIZE {}", resampler16_getLatency(resampler16), max_len, samples.len());
-        resampler16_destroy(resampler16);
-    }
-
     // Map the tracked indices to the new sample rate
-    for tracked in tracked_sample_points.iter_mut() {
-        *tracked = (*tracked as f64 * (dest_sample_rate / src_sample_rate)).round() as usize;
-        if *tracked >= samples.len() {
-            *tracked = samples.len()-1;
+    let tracked_sample_points: Vec<usize> = track_sample_points.iter().map(|&x| {
+        let mut tracked = (x as f64 * (dest_sample_rate / src_sample_rate)).round() as usize;
+        if tracked >= samples.len() {
+            tracked = samples.len()-1;
         }
+        tracked
+    }).collect();
+
+    let mut samples_processed: Vec<i16>;
+    if !samples.is_empty() {
+        // Resampler expects floating point samples. Convert.
+        let mut samples_f64: Vec<f64> = samples.iter().map(|&x| to_f64_audio(x)).collect();
+
+        // Resample to target sample rate.
+        unsafe {
+            let resampler16 = resampler16_create(src_sample_rate, dest_sample_rate, samples_f64.len() as i32, 2.0);
+            let resample = |resampler16: *mut HCDSPResampler16, samples_f64: &mut Vec<f64>| {
+                let mut output_array_pointer: *mut c_double = null_mut();
+                let output_array_len = resampler16_process(resampler16, samples_f64.as_mut_ptr(), samples_f64.len() as i32, &mut output_array_pointer as *mut *mut c_double);
+                if let None = output_array_pointer.as_ref() {
+                    panic!("Something happened during resampling!");
+                }
+                std::slice::from_raw_parts(output_array_pointer, output_array_len as usize).iter().map(to_16bit_pcm_audio)
+            };
+            samples_processed = resample(resampler16, &mut samples_f64).collect();
+            let max_len = resampler16_getMaxOutLen(resampler16, samples_f64.len() as i32) as usize;
+            while samples.len() < max_len {
+                samples_processed.extend(resample(resampler16, &mut vec![0.0; samples_f64.len()])); // Flush the resampler
+            }
+            if samples.len() > max_len {
+                samples_processed.resize(max_len, 0);
+            }
+            println!("LATENCY {} SIZE {} ACTUAL_SIZE {}", resampler16_getLatency(resampler16), max_len, samples.len());
+            resampler16_destroy(resampler16);
+        }
+    } else {
+        samples_processed = Vec::new();
     }
 
     (samples_processed, tracked_sample_points)
