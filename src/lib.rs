@@ -45,16 +45,15 @@ impl std::fmt::Display for TrackingError {
     }
 }
 
-pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, samples_per_block: Option<usize>, track_sample_points: &[usize]) -> (Vec<u8>, Result<Vec<usize>, TrackingError>) {
-    let tracked_sample_points: Vec<usize>;
-    (samples, tracked_sample_points) = resample_mono_16bitpcm(&samples, src_sample_rate, dest_sample_rate, track_sample_points);
+pub fn process_mono(samples: &[i16], src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, samples_per_block: Option<usize>, track_sample_points: &[usize]) -> (Vec<u8>, Result<Vec<usize>, TrackingError>) {
+    let (samples, tracked_sample_points) = resample_mono_16bitpcm(samples, src_sample_rate, dest_sample_rate, track_sample_points);
     encode_adpcm_mono_16bitpcm(&samples, lookahead, samples_per_block, &tracked_sample_points)
 }
 
-pub fn process_mono_preserve_looping(mut samples: Vec<i16>, mut samples_looped: Vec<i16>, src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, samples_per_block: Option<usize>) -> (Vec<u8>, Result<Vec<usize>, TrackingError>) {
+pub fn process_mono_preserve_looping(samples: &[i16], samples_looped: &[i16], src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, samples_per_block: Option<usize>) -> (Vec<u8>, Result<Vec<usize>, TrackingError>) {
     // Resample both segments separately
-    (samples, _) = resample_mono_16bitpcm(&samples, src_sample_rate, dest_sample_rate, &[]);
-    (samples_looped, _) = resample_mono_16bitpcm(&samples_looped, src_sample_rate, dest_sample_rate, &[]);
+    let (mut samples, _) = resample_mono_16bitpcm(samples, src_sample_rate, dest_sample_rate, &[]);
+    let (samples_looped, _) = resample_mono_16bitpcm(samples_looped, src_sample_rate, dest_sample_rate, &[]);
     
     // Zero-pad the front so that the end of the `samples` segment align perfectly with the start of the `samples_looped` segment
     fn prepend<T: Clone>(v: &mut Vec<T>, x: T, n: usize) {
