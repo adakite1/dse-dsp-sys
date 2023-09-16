@@ -52,18 +52,18 @@ pub fn process_mono(mut samples: Vec<i16>, src_sample_rate: f64, dest_sample_rat
 }
 
 pub fn process_mono_preserve_looping(mut samples: Vec<i16>, mut samples_looped: Vec<i16>, src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, samples_per_block: Option<usize>) -> (Vec<u8>, Result<Vec<usize>, TrackingError>) {
+    // Resample both segments separately
+    (samples, _) = resample_mono_16bitpcm(&samples, src_sample_rate, dest_sample_rate, &[]);
+    (samples_looped, _) = resample_mono_16bitpcm(&samples_looped, src_sample_rate, dest_sample_rate, &[]);
+    
     // Zero-pad the front so that the end of the `samples` segment align perfectly with the start of the `samples_looped` segment
     fn prepend<T: Clone>(v: &mut Vec<T>, x: T, n: usize) {
         v.resize(v.len() + n, x);
         v.rotate_right(n);
     }
-    let zero_pad_front = (4 - (samples.len() % 4)) % 4;
+    let zero_pad_front = (8 - (samples.len() % 8)) % 8;
     prepend(&mut samples, 0, zero_pad_front);
 
-    // Resample both segments separately
-    (samples, _) = resample_mono_16bitpcm(&samples, src_sample_rate, dest_sample_rate, &[]);
-    (samples_looped, _) = resample_mono_16bitpcm(&samples_looped, src_sample_rate, dest_sample_rate, &[]);
-    
     // Combine the two segments, taking note of where the loop positions have moved to
     let loop_start_in_sample_points = samples.len(); // The first sample in the loop is the sample right next to the last sample in the `samples` segment
     let loop_end_in_sample_points = samples.len() + samples_looped.len() - 1; // The last sample in the loop
