@@ -51,9 +51,26 @@ pub fn process_mono(samples: &[i16], src_sample_rate: f64, dest_sample_rate: f64
 }
 
 pub fn process_mono_preserve_looping(samples: &[i16], samples_looped: &[i16], src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, samples_per_block: Option<usize>) -> (Vec<u8>, Result<Vec<usize>, TrackingError>) {
+    // Extend the loop if it's too short
+    fn repetition_factor(mut x: usize, src_sample_rate: f64, dest_sample_rate: f64) -> usize {
+        x = (x as f64 * (dest_sample_rate / src_sample_rate)).round() as usize;
+        let mut fac = -((x as f64 - 100.0 - 1.0) / x as f64);
+        if fac <= 0.0 {
+            fac = 0.0;
+        }
+        if fac >= 100.0 {
+            fac = 100.0;
+        }
+        println!("LOOPLEN AFTER SMPLRATE CHANGE: {} REPEATING BY: {}", x, fac.round());
+        fac.round() as usize
+    }
+    let samples_looped_extended: Vec<i16> = std::iter::repeat_with(|| samples_looped.iter().cloned())
+        .take(1 + repetition_factor(samples_looped.len(), src_sample_rate, dest_sample_rate))
+        .flatten().collect();
+    
     // Resample both segments separately
     let (mut samples, _) = resample_mono_16bitpcm(samples, src_sample_rate, dest_sample_rate, &[]);
-    let (samples_looped, _) = resample_mono_16bitpcm(samples_looped, src_sample_rate, dest_sample_rate, &[]);
+    let (samples_looped, _) = resample_mono_16bitpcm(&samples_looped_extended, src_sample_rate, dest_sample_rate, &[]);
     
     // Zero-pad the front so that the end of the `samples` segment align perfectly with the start of the `samples_looped` segment
     fn prepend<T: Clone>(v: &mut Vec<T>, x: T, n: usize) {
