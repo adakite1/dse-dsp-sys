@@ -70,7 +70,7 @@ pub fn process_mono_preserve_looping(samples: &[i16], samples_looped: &[i16], sr
     
     // Resample both segments separately
     let (mut samples, _) = resample_mono_16bitpcm(samples, src_sample_rate, dest_sample_rate, &[]);
-    let (samples_looped, _) = resample_mono_16bitpcm(&samples_looped_extended, src_sample_rate, dest_sample_rate, &[]);
+    let (mut samples_looped, _) = resample_mono_16bitpcm(&samples_looped_extended, src_sample_rate, dest_sample_rate, &[]);
     
     // Zero-pad the front so that the end of the `samples` segment align perfectly with the start of the `samples_looped` segment
     fn prepend<T: Clone>(v: &mut Vec<T>, x: T, n: usize) {
@@ -79,6 +79,25 @@ pub fn process_mono_preserve_looping(samples: &[i16], samples_looped: &[i16], sr
     }
     let zero_pad_front = (8 - (samples.len() % 8)) % 8;
     prepend(&mut samples, 0, zero_pad_front);
+    
+    // Pad the back of the loop so that the end of the `samples_looped` segment also aligns with 8 sample points
+    fn interp(x: f64, y: &[f64]) -> f64 {
+        // Optimal 2x (2-point, 3rd-order) (z-form)
+        let z = x - 1.0/2.0;
+        let (even1, odd1) = (y[1]+y[0], y[1]-y[0]);
+        let c0 = even1*0.50037842517188658;
+        let c1 = odd1*1.00621089801788210;
+        let c2 = even1*-0.004541102062639801;
+        let c3 = odd1*-1.57015627178718420;
+        return ((c3*z+c2)*z+c1)*z+c0;
+    }
+    if !samples_looped.is_empty() {
+        let pad_back = (8 - (samples_looped.len() % 8)) % 8;
+        let step = 1.0_f64 / (pad_back + 1) as f64;
+        for i in 0..pad_back {
+            samples_looped.push(interp((i+1) as f64 * step, &[*samples.last().unwrap() as f64, *samples.first().unwrap() as f64]).round() as i16);
+        }
+    }
 
     // Combine the two segments, taking note of where the loop positions have moved to
     let loop_start_in_sample_points = samples.len(); // The first sample in the loop is the sample right next to the last sample in the `samples` segment
