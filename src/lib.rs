@@ -177,13 +177,13 @@ pub fn resample_mono_16bitpcm(samples: &[i16], src_sample_rate: f64, dest_sample
             };
             samples_processed = resample(resampler16, &mut samples_f64).collect();
             let max_len = resampler16_getMaxOutLen(resampler16, samples_f64.len() as i32) as usize;
-            while samples.len() < max_len {
+            while samples_processed.len() < max_len {
                 samples_processed.extend(resample(resampler16, &mut vec![0.0; samples_f64.len()])); // Flush the resampler
             }
-            if samples.len() > max_len {
+            if samples_processed.len() > max_len {
                 samples_processed.resize(max_len, 0);
             }
-            println!("LATENCY {} SIZE {} ACTUAL_SIZE {}", resampler16_getLatency(resampler16), max_len, samples.len());
+            println!("LATENCY {} SIZE {} ACTUAL_SIZE {}", resampler16_getLatency(resampler16), max_len, samples_processed.len());
             resampler16_destroy(resampler16);
         }
     } else {
