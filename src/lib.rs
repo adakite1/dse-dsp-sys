@@ -69,8 +69,32 @@ pub fn process_mono_preserve_looping(samples: &[i16], samples_looped: &[i16], sr
         .flatten().collect();
     
     // Resample both segments separately
+    let looped_segment_dest_sample_rate;
+    let resampled_len_preview = resample_len_preview(src_sample_rate, dest_sample_rate, samples_looped.len());
+    if resampled_len_preview >= 9 { // Minimum for these calculations to work
+        fn get_sample_rate(desired_out_len: usize, src_sample_rate: f64, samples_looped: &[i16]) -> f64 {
+            // The subtraction by 1.51 is to deal with the `ceil` in the original max_len calculation found inside r8brain
+            (desired_out_len as f64 - 1.51) * (src_sample_rate / samples_looped.len() as f64)
+        }
+        let choice_1_desired_out_len = ((resampled_len_preview - 1) | 7) + 1;
+        let choice_1 = get_sample_rate(choice_1_desired_out_len, src_sample_rate, samples_looped);
+        let choice_2_desired_out_len = ((resampled_len_preview - 1 - 8) | 7) + 1;
+        let choice_2 = get_sample_rate(choice_2_desired_out_len, src_sample_rate, samples_looped);
+        println!("C1 DESIRED OUT LEN: {} LOOPED SMPLRATE: {} LENGTH VERIFY: {}", choice_1_desired_out_len, choice_1, resample_len_preview(src_sample_rate, choice_1, samples_looped.len()));
+        println!("C2 DESIRED OUT LEN: {} LOOPED SMPLRATE: {} LENGTH VERIFY: {}", choice_2_desired_out_len, choice_2, resample_len_preview(src_sample_rate, choice_2, samples_looped.len()));
+        assert!(choice_1_desired_out_len == resample_len_preview(src_sample_rate, choice_1, samples_looped.len()));
+        assert!(choice_2_desired_out_len == resample_len_preview(src_sample_rate, choice_2, samples_looped.len()));
+        if (choice_1 - dest_sample_rate).abs() <= (choice_2 - dest_sample_rate).abs() {
+            looped_segment_dest_sample_rate = choice_1;
+        } else {
+            looped_segment_dest_sample_rate = choice_2;
+        }
+    } else {
+        looped_segment_dest_sample_rate = dest_sample_rate;
+    }
+
     let (mut samples, _) = resample_mono_16bitpcm(samples, src_sample_rate, dest_sample_rate, &[]);
-    let (mut samples_looped, _) = resample_mono_16bitpcm(&samples_looped_extended, src_sample_rate, dest_sample_rate, &[]);
+    let (mut samples_looped, _) = resample_mono_16bitpcm(&samples_looped_extended, src_sample_rate, looped_segment_dest_sample_rate, &[]);
     
     // Zero-pad the front so that the end of the `samples` segment align perfectly with the start of the `samples_looped` segment
     fn prepend<T: Clone>(v: &mut Vec<T>, x: T, n: usize) {
@@ -91,11 +115,14 @@ pub fn process_mono_preserve_looping(samples: &[i16], samples_looped: &[i16], sr
         let c3 = odd1*-1.57015627178718420;
         return ((c3*z+c2)*z+c1)*z+c0;
     }
+    // ONLY RUNS FOR SITUATIONS WHERE THE ABOVE CALCULATION CANNOT BE PERFORMED!
+    //  This can introduce certain artifacts to the sound, but it *can* ensure that the outputted note is correct.
     if !samples_looped.is_empty() {
         let pad_back = (8 - (samples_looped.len() % 8)) % 8;
         let step = 1.0_f64 / (pad_back + 1) as f64;
+        let y = [*samples_looped.last().unwrap() as f64, *samples_looped.first().unwrap() as f64];
         for i in 0..pad_back {
-            samples_looped.push(interp((i+1) as f64 * step, &[*samples.last().unwrap() as f64, *samples.first().unwrap() as f64]).round() as i16);
+            samples_looped.push(interp((i+1) as f64 * step, &y).round() as i16);
         }
     }
 
@@ -183,6 +210,13 @@ pub fn encode_adpcm_mono_16bitpcm(samples: &[i16], lookahead: c_int, samples_per
     }
 
     (samples_adpcm, tracked_to.into_iter().collect::<Result<Vec<usize>, TrackingError>>())
+}
+
+pub fn resample_len_preview(src_sample_rate: f64, dest_sample_rate: f64, n_samples: usize) -> usize {
+    unsafe {
+        let resampler16 = resampler16_create(src_sample_rate, dest_sample_rate, n_samples as i32, 2.0);
+        resampler16_getMaxOutLen(resampler16, n_samples as i32) as usize
+    }
 }
 
 pub fn resample_mono_16bitpcm(samples: &[i16], src_sample_rate: f64, dest_sample_rate: f64, track_sample_points: &[usize]) -> (Vec<i16>, Vec<usize>) {
