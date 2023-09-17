@@ -69,7 +69,7 @@ pub fn process_mono_preserve_looping(samples: &[i16], samples_looped: &[i16], sr
         .flatten().collect();
     
     // Resample both segments separately
-    let looped_segment_dest_sample_rate;
+    let mut looped_segment_dest_sample_rate;
     let resampled_len_preview = resample_len_preview(src_sample_rate, dest_sample_rate, samples_looped.len());
     if resampled_len_preview >= 9 { // Minimum for these calculations to work
         fn get_sample_rate(desired_out_len: usize, src_sample_rate: f64, samples_looped: &[i16]) -> f64 {
@@ -88,6 +88,15 @@ pub fn process_mono_preserve_looping(samples: &[i16], samples_looped: &[i16], sr
             looped_segment_dest_sample_rate = choice_1;
         } else {
             looped_segment_dest_sample_rate = choice_2;
+        }
+        let ratio;
+        if looped_segment_dest_sample_rate >= dest_sample_rate {
+            ratio = looped_segment_dest_sample_rate / dest_sample_rate;
+        } else {
+            ratio = dest_sample_rate / looped_segment_dest_sample_rate;
+        }
+        if ratio > 2_f64.powf(30.0/1200.0) { // If the change in sample rate will cause the sample to sound off by more than 30 cents, bail
+            looped_segment_dest_sample_rate = dest_sample_rate;
         }
     } else {
         looped_segment_dest_sample_rate = dest_sample_rate;
