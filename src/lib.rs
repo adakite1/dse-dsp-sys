@@ -50,22 +50,22 @@ pub fn process_mono(samples: &[i16], src_sample_rate: f64, dest_sample_rate: f64
     encode_adpcm_mono_16bitpcm(&samples, lookahead, samples_per_block, &tracked_sample_points)
 }
 
-pub fn process_mono_preserve_looping(samples: &[i16], samples_looped: &[i16], src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, samples_per_block: Option<usize>) -> (Vec<u8>, Result<Vec<usize>, TrackingError>) {
+pub fn process_mono_preserve_looping(samples: &[i16], samples_looped: &[i16], src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, min_loop_len: usize, max_allowed_loop_pitch_shift: f64, samples_per_block: Option<usize>) -> (Vec<u8>, Result<Vec<usize>, TrackingError>) {
     // Extend the loop if it's too short
-    fn repetition_factor(mut x: usize, src_sample_rate: f64, dest_sample_rate: f64) -> usize {
+    fn repetition_factor(mut x: usize, src_sample_rate: f64, dest_sample_rate: f64, min_loop_len: usize) -> usize {
         x = (x as f64 * (dest_sample_rate / src_sample_rate)).round() as usize;
-        let mut fac = -((x as f64 - 100.0 - 1.0) / x as f64);
+        let mut fac = min_loop_len as f64 / x as f64;
         if fac <= 0.0 {
             fac = 0.0;
         }
-        if fac >= 100.0 {
-            fac = 100.0;
+        if fac >= min_loop_len as f64 {
+            fac = min_loop_len as f64;
         }
         println!("LOOPLEN AFTER SMPLRATE CHANGE: {} REPEATING BY: {}", x, fac.round());
         fac.round() as usize
     }
     let samples_looped_extended: Vec<i16> = std::iter::repeat_with(|| samples_looped.iter().cloned())
-        .take(1 + repetition_factor(samples_looped.len(), src_sample_rate, dest_sample_rate))
+        .take(1 + repetition_factor(samples_looped.len(), src_sample_rate, dest_sample_rate, min_loop_len))
         .flatten().collect();
     
     // Resample both segments separately
@@ -95,7 +95,7 @@ pub fn process_mono_preserve_looping(samples: &[i16], samples_looped: &[i16], sr
         } else {
             ratio = dest_sample_rate / looped_segment_dest_sample_rate;
         }
-        if ratio > 2_f64.powf(30.0/1200.0) { // If the change in sample rate will cause the sample to sound off by more than 30 cents, bail
+        if ratio > 2_f64.powf(max_allowed_loop_pitch_shift/1200.0) { // If the change in sample rate will cause the sample to sound off by more than max_allowed_loop_pitch_shift cents, bail
             looped_segment_dest_sample_rate = dest_sample_rate;
         }
     } else {
