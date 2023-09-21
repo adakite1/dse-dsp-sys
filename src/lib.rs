@@ -70,20 +70,20 @@ pub fn process_mono_preserve_looping(samples: &[i16], samples_looped: &[i16], sr
     
     // Resample both segments separately
     let mut looped_segment_dest_sample_rate;
-    let resampled_len_preview = resample_len_preview(src_sample_rate, dest_sample_rate, samples_looped.len());
+    let resampled_len_preview = resample_len_preview(src_sample_rate, dest_sample_rate, samples_looped_extended.len());
     if resampled_len_preview >= 9 { // Minimum for these calculations to work
         fn get_sample_rate(desired_out_len: usize, src_sample_rate: f64, samples_looped: &[i16]) -> f64 {
             // The subtraction by 1.51 is to deal with the `ceil` in the original max_len calculation found inside r8brain
             (desired_out_len as f64 - 1.51) * (src_sample_rate / samples_looped.len() as f64)
         }
         let choice_1_desired_out_len = ((resampled_len_preview - 1) | 7) + 1;
-        let choice_1 = get_sample_rate(choice_1_desired_out_len, src_sample_rate, samples_looped);
+        let choice_1 = get_sample_rate(choice_1_desired_out_len, src_sample_rate, &samples_looped_extended);
         let choice_2_desired_out_len = ((resampled_len_preview - 1 - 8) | 7) + 1;
-        let choice_2 = get_sample_rate(choice_2_desired_out_len, src_sample_rate, samples_looped);
-        println!("C1 DESIRED OUT LEN: {} LOOPED SMPLRATE: {} LENGTH VERIFY: {}", choice_1_desired_out_len, choice_1, resample_len_preview(src_sample_rate, choice_1, samples_looped.len()));
-        println!("C2 DESIRED OUT LEN: {} LOOPED SMPLRATE: {} LENGTH VERIFY: {}", choice_2_desired_out_len, choice_2, resample_len_preview(src_sample_rate, choice_2, samples_looped.len()));
-        assert!(choice_1_desired_out_len == resample_len_preview(src_sample_rate, choice_1, samples_looped.len()));
-        assert!(choice_2_desired_out_len == resample_len_preview(src_sample_rate, choice_2, samples_looped.len()));
+        let choice_2 = get_sample_rate(choice_2_desired_out_len, src_sample_rate, &samples_looped_extended);
+        println!("C1 DESIRED OUT LEN: {} LOOPED SMPLRATE: {} LENGTH VERIFY: {}", choice_1_desired_out_len, choice_1, resample_len_preview(src_sample_rate, choice_1, samples_looped_extended.len()));
+        println!("C2 DESIRED OUT LEN: {} LOOPED SMPLRATE: {} LENGTH VERIFY: {}", choice_2_desired_out_len, choice_2, resample_len_preview(src_sample_rate, choice_2, samples_looped_extended.len()));
+        assert!(choice_1_desired_out_len == resample_len_preview(src_sample_rate, choice_1, samples_looped_extended.len()));
+        assert!(choice_2_desired_out_len == resample_len_preview(src_sample_rate, choice_2, samples_looped_extended.len()));
         if (choice_1 - dest_sample_rate).abs() <= (choice_2 - dest_sample_rate).abs() {
             looped_segment_dest_sample_rate = choice_1;
         } else {
