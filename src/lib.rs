@@ -50,7 +50,16 @@ pub fn process_mono(samples: &[i16], src_sample_rate: f64, dest_sample_rate: f64
     encode_adpcm_mono_16bitpcm(&samples, lookahead, samples_per_block, &tracked_sample_points)
 }
 
-pub fn process_mono_preserve_looping(samples: &[i16], samples_looped: &[i16], src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, min_loop_len: usize, max_allowed_loop_pitch_shift: f64, samples_per_block: Option<usize>) -> (Vec<u8>, Result<Vec<usize>, TrackingError>) {
+#[derive(Clone, Copy, Debug)]
+pub enum SampleRateChoicePreference {
+    /// Will always pick the lower sample rate that satisfies the alignment for the looping
+    Lower,
+    /// Will always pick the higher sample rate that satisfies the alignment for the looping
+    Higher,
+    /// Will pick the sample rate closest to the originally specified sample rate
+    Nearest
+}
+pub fn process_mono_preserve_looping(samples: &[i16], samples_looped: &[i16], src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, min_loop_len: usize, sample_rate_choice_preference: SampleRateChoicePreference, samples_per_block: Option<usize>) -> (Vec<u8>, f64, Result<Vec<usize>, TrackingError>) {
     // Extend the loop if it's too short
     fn repetition_factor(mut x: usize, src_sample_rate: f64, dest_sample_rate: f64, min_loop_len: usize) -> usize {
         x = (x as f64 * (dest_sample_rate / src_sample_rate)).round() as usize;
@@ -69,7 +78,7 @@ pub fn process_mono_preserve_looping(samples: &[i16], samples_looped: &[i16], sr
         .flatten().collect();
     
     // Resample both segments separately
-    let mut looped_segment_dest_sample_rate;
+    let looped_segment_dest_sample_rate;
     let resampled_len_preview = resample_len_preview(src_sample_rate, dest_sample_rate, samples_looped_extended.len());
     if resampled_len_preview >= 9 { // Minimum for these calculations to work
         fn get_sample_rate(desired_out_len: usize, src_sample_rate: f64, samples_looped: &[i16]) -> f64 {
@@ -84,26 +93,21 @@ pub fn process_mono_preserve_looping(samples: &[i16], samples_looped: &[i16], sr
         println!("C2 DESIRED OUT LEN: {} LOOPED SMPLRATE: {} LENGTH VERIFY: {}", choice_2_desired_out_len, choice_2, resample_len_preview(src_sample_rate, choice_2, samples_looped_extended.len()));
         assert!(choice_1_desired_out_len == resample_len_preview(src_sample_rate, choice_1, samples_looped_extended.len()));
         assert!(choice_2_desired_out_len == resample_len_preview(src_sample_rate, choice_2, samples_looped_extended.len()));
-        if (choice_1 - dest_sample_rate).abs() <= (choice_2 - dest_sample_rate).abs() {
-            looped_segment_dest_sample_rate = choice_1;
-        } else {
-            looped_segment_dest_sample_rate = choice_2;
-        }
-        let ratio;
-        if looped_segment_dest_sample_rate >= dest_sample_rate {
-            ratio = looped_segment_dest_sample_rate / dest_sample_rate;
-        } else {
-            ratio = dest_sample_rate / looped_segment_dest_sample_rate;
-        }
-        if ratio > 2_f64.powf(max_allowed_loop_pitch_shift/1200.0) { // If the change in sample rate will cause the sample to sound off by more than max_allowed_loop_pitch_shift cents, bail
-            looped_segment_dest_sample_rate = dest_sample_rate;
-        }
+        looped_segment_dest_sample_rate = match sample_rate_choice_preference {
+            SampleRateChoicePreference::Higher => choice_1,
+            SampleRateChoicePreference::Lower => choice_2,
+            SampleRateChoicePreference::Nearest => if (choice_1 - dest_sample_rate).abs() <= (choice_2 - dest_sample_rate).abs() {
+                choice_1
+            } else {
+                choice_2
+            }
+        };
     } else {
         looped_segment_dest_sample_rate = dest_sample_rate;
     }
 
-    let (mut samples, _) = resample_mono_16bitpcm(samples, src_sample_rate, dest_sample_rate, &[]);
-    let (mut samples_looped, _) = resample_mono_16bitpcm(&samples_looped_extended, src_sample_rate, looped_segment_dest_sample_rate, &[]);
+    let (mut samples, _) = resample_mono_16bitpcm(samples, src_sample_rate, looped_segment_dest_sample_rate, &[]);
+    let (samples_looped, _) = resample_mono_16bitpcm(&samples_looped_extended, src_sample_rate, looped_segment_dest_sample_rate, &[]);
     
     // Zero-pad the front so that the end of the `samples` segment align perfectly with the start of the `samples_looped` segment
     fn prepend<T: Clone>(v: &mut Vec<T>, x: T, n: usize) {
@@ -112,28 +116,6 @@ pub fn process_mono_preserve_looping(samples: &[i16], samples_looped: &[i16], sr
     }
     let zero_pad_front = (8 - (samples.len() % 8)) % 8;
     prepend(&mut samples, 0, zero_pad_front);
-    
-    // Pad the back of the loop so that the end of the `samples_looped` segment also aligns with 8 sample points
-    fn interp(x: f64, y: &[f64]) -> f64 {
-        // Optimal 2x (2-point, 3rd-order) (z-form)
-        let z = x - 1.0/2.0;
-        let (even1, odd1) = (y[1]+y[0], y[1]-y[0]);
-        let c0 = even1*0.50037842517188658;
-        let c1 = odd1*1.00621089801788210;
-        let c2 = even1*-0.004541102062639801;
-        let c3 = odd1*-1.57015627178718420;
-        return ((c3*z+c2)*z+c1)*z+c0;
-    }
-    // ONLY RUNS FOR SITUATIONS WHERE THE ABOVE CALCULATION CANNOT BE PERFORMED!
-    //  This can introduce certain artifacts to the sound, but it *can* ensure that the outputted note is correct.
-    if !samples_looped.is_empty() {
-        let pad_back = (8 - (samples_looped.len() % 8)) % 8;
-        let step = 1.0_f64 / (pad_back + 1) as f64;
-        let y = [*samples_looped.last().unwrap() as f64, *samples_looped.first().unwrap() as f64];
-        for i in 0..pad_back {
-            samples_looped.push(interp((i+1) as f64 * step, &y).round() as i16);
-        }
-    }
 
     // Combine the two segments, taking note of where the loop positions have moved to
     let loop_start_in_sample_points = samples.len(); // The first sample in the loop is the sample right next to the last sample in the `samples` segment
@@ -141,7 +123,8 @@ pub fn process_mono_preserve_looping(samples: &[i16], samples_looped: &[i16], sr
     samples.extend(samples_looped); // Concat
 
     // Encode ADPCM
-    encode_adpcm_mono_16bitpcm(&samples, lookahead, samples_per_block, &[loop_start_in_sample_points, loop_end_in_sample_points])
+    let (resampled, tracking) = encode_adpcm_mono_16bitpcm(&samples, lookahead, samples_per_block, &[loop_start_in_sample_points, loop_end_in_sample_points]);
+    (resampled, looped_segment_dest_sample_rate, tracking)
 }
 
 pub fn encode_adpcm_mono_16bitpcm(samples: &[i16], lookahead: c_int, samples_per_block: Option<usize>, track_sample_points: &[usize]) -> (Vec<u8>, Result<Vec<usize>, TrackingError>) {
