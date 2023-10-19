@@ -45,11 +45,9 @@ impl std::fmt::Display for TrackingError {
     }
 }
 
-pub fn process_mono<InitDeltas>(samples: &[i16], src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, calc_initial_deltas: InitDeltas, samples_per_block: Option<usize>, track_sample_points: &[usize]) -> (Vec<u8>, Result<Vec<usize>, TrackingError>)
-where
-    InitDeltas: FnOnce(&[i16]) -> i32 {
+pub fn process_mono(samples: &[i16], src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, samples_per_block: Option<usize>, track_sample_points: &[usize]) -> (Vec<u8>, Result<Vec<usize>, TrackingError>) {
     let (samples, tracked_sample_points) = resample_mono_16bitpcm(samples, src_sample_rate, dest_sample_rate, track_sample_points);
-    encode_adpcm_mono_16bitpcm(&samples, lookahead, calc_initial_deltas, samples_per_block, &tracked_sample_points)
+    encode_adpcm_mono_16bitpcm(&samples, lookahead, samples_per_block, &tracked_sample_points)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -61,9 +59,7 @@ pub enum SampleRateChoicePreference {
     /// Will pick the sample rate closest to the originally specified sample rate
     Nearest
 }
-pub fn process_mono_preserve_looping<InitDeltas>(samples: &[i16], samples_looped: &[i16], src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, calc_initial_deltas: InitDeltas, min_loop_len: usize, sample_rate_choice_preference: SampleRateChoicePreference, samples_per_block: Option<usize>) -> (Vec<u8>, f64, Result<Vec<usize>, TrackingError>)
-where
-    InitDeltas: FnOnce(&[i16]) -> i32 {
+pub fn process_mono_preserve_looping(samples: &[i16], samples_looped: &[i16], src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, min_loop_len: usize, sample_rate_choice_preference: SampleRateChoicePreference, samples_per_block: Option<usize>) -> (Vec<u8>, f64, Result<Vec<usize>, TrackingError>) {
     // Extend the loop if it's too short
     fn repetition_factor(mut x: usize, src_sample_rate: f64, dest_sample_rate: f64, min_loop_len: usize) -> usize {
         x = (x as f64 * (dest_sample_rate / src_sample_rate)).round() as usize;
@@ -127,25 +123,11 @@ where
     samples.extend(samples_looped); // Concat
 
     // Encode ADPCM
-    let (resampled, tracking) = encode_adpcm_mono_16bitpcm(&samples, lookahead, calc_initial_deltas, samples_per_block, &[loop_start_in_sample_points, loop_end_in_sample_points]);
+    let (resampled, tracking) = encode_adpcm_mono_16bitpcm(&samples, lookahead, samples_per_block, &[loop_start_in_sample_points, loop_end_in_sample_points]);
     (resampled, looped_segment_dest_sample_rate, tracking)
 }
 
-pub mod init_deltas {
-    pub fn averaging(samples: &[i16]) -> i32 {
-        let mut average_delta: i32 = 0;
-        for i in (samples.len()-1)..0 {
-            average_delta -= average_delta / 8;
-            average_delta += (samples[i] as i32 - samples[i-1] as i32).abs();
-        }
-        average_delta /= 8;
-        average_delta
-    }
-}
-
-pub fn encode_adpcm_mono_16bitpcm<InitDeltas>(samples: &[i16], lookahead: c_int, calc_initial_deltas: InitDeltas, samples_per_block: Option<usize>, track_sample_points: &[usize]) -> (Vec<u8>, Result<Vec<usize>, TrackingError>)
-where
-    InitDeltas: FnOnce(&[i16]) -> i32 {
+pub fn encode_adpcm_mono_16bitpcm(samples: &[i16], lookahead: c_int, samples_per_block: Option<usize>, track_sample_points: &[usize]) -> (Vec<u8>, Result<Vec<usize>, TrackingError>) {
     let mut tracked_to: Vec<Result<usize, TrackingError>> = vec![Err(TrackingError {  }); track_sample_points.len()];
     
     let preferred_samples_per_block;
@@ -157,10 +139,15 @@ where
     let samples_per_block = ((preferred_samples_per_block - 2) | 7) + 2;
 
     // Encode samples with ADPCM
-    let mut initial_deltas = calc_initial_deltas(samples);
+    let mut average_delta: i32 = 0;
+    for i in (samples.len()-1)..0 {
+        average_delta -= average_delta / 8;
+        average_delta += (samples[i] as i32 - samples[i-1] as i32).abs();
+    }
+    average_delta /= 8;
     let mut samples_adpcm: Vec<u8> = Vec::new();
     unsafe {
-        let adpcmctx = adpcm_create_context(1, lookahead, 2, &mut initial_deltas as *mut i32);
+        let adpcmctx = adpcm_create_context(1, lookahead, 2, &mut average_delta as *mut i32);
         {
             let mut block_size = (samples_per_block - 1) / 2 + 4;
             let block_size_static = block_size;
