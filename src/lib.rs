@@ -1,6 +1,7 @@
 use std::{ffi::{c_double, c_int}, ptr::null_mut};
 
 use adpcm_xq_sys::{adpcm_create_context, adpcm_encode_block, adpcm_free_context};
+use block_alignment::BlockAlignment;
 
 // Bindings to the r8brain resampler
 #[repr(C)]
@@ -45,9 +46,42 @@ impl std::fmt::Display for TrackingError {
     }
 }
 
-pub fn process_mono(samples: &[i16], src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, samples_per_block: Option<usize>, track_sample_points: &[usize]) -> (Vec<u8>, Result<Vec<usize>, TrackingError>) {
+pub fn process_mono<InitDeltas>(samples: &[i16], src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, calc_initial_deltas: InitDeltas, samples_per_block: Option<usize>, track_sample_points: &[usize]) -> (Vec<u8>, Result<Vec<usize>, TrackingError>)
+where
+    InitDeltas: FnOnce(&[i16]) -> i32 {
     let (samples, tracked_sample_points) = resample_mono_16bitpcm(samples, src_sample_rate, dest_sample_rate, track_sample_points);
-    encode_adpcm_mono_16bitpcm(&samples, lookahead, samples_per_block, &tracked_sample_points)
+    adpcm_encode_mono_16bitpcm(&samples, lookahead, calc_initial_deltas, samples_per_block, &tracked_sample_points)
+}
+
+pub mod block_alignment {
+    pub trait BlockAlignment {
+        fn round_up(&self, n_samples: usize) -> usize;
+        fn zero_pad_front(&self, n_samples: usize) -> usize;
+        fn generate_aligned_options(&self, n_samples: usize) -> Vec<usize>;
+    }
+    pub struct To8Bytes();
+    impl BlockAlignment for To8Bytes {
+        fn round_up(&self, n_samples: usize) -> usize {
+            if n_samples == 0 {
+                0
+            } else {
+                ((n_samples - 1) | 7) + 1
+            }
+        }
+        fn zero_pad_front(&self, n_samples: usize) -> usize {
+            self.round_up(n_samples) - n_samples + 1 // The plus one is for alignment since the first sample is encoded as a part of the adpcm initializers.
+        }
+        fn generate_aligned_options(&self, n_samples: usize) -> Vec<usize> {
+            let mut choices = Vec::with_capacity(2);
+            if n_samples > 0 {
+                choices.push(((n_samples - 1) | 7) + 1);
+            }
+            if n_samples >= 9 {
+                choices.push(((n_samples - 1 - 8) | 7) + 1);
+            }
+            choices
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -57,9 +91,18 @@ pub enum SampleRateChoicePreference {
     /// Will always pick the higher sample rate that satisfies the alignment for the looping
     Higher,
     /// Will pick the sample rate closest to the originally specified sample rate
-    Nearest
+    Nearest,
+    /// Will pick the sample rate that allows for the least amount of zero-padding at the front
+    MinStartPad
 }
-pub fn process_mono_preserve_looping(samples: &[i16], samples_looped: &[i16], src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, min_loop_len: usize, sample_rate_choice_preference: SampleRateChoicePreference, samples_per_block: Option<usize>) -> (Vec<u8>, f64, Result<Vec<usize>, TrackingError>) {
+pub fn get_sample_rate_by_out_samples(src_sample_rate: f64, n_samples: usize, n_samples_target: usize) -> f64 {
+    // The subtraction by 1.51 is to deal with the `ceil` in the original max_len calculation found inside r8brain
+    (n_samples_target as f64 - 1.51) * (src_sample_rate / n_samples as f64)
+}
+pub fn process_mono_preserve_looping<InitDeltas, A>(samples: &[i16], samples_looped: &[i16], src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, calc_initial_deltas: InitDeltas, min_loop_len: usize, block_alignment: A, sample_rate_choice_preference: SampleRateChoicePreference, samples_per_block: Option<usize>) -> (Vec<u8>, f64, Result<Vec<usize>, TrackingError>)
+where
+    InitDeltas: FnOnce(&[i16]) -> i32,
+    A: BlockAlignment {
     // Extend the loop if it's too short
     fn repetition_factor(mut x: usize, src_sample_rate: f64, dest_sample_rate: f64, min_loop_len: usize) -> usize {
         x = (x as f64 * (dest_sample_rate / src_sample_rate)).round() as usize;
@@ -80,30 +123,25 @@ pub fn process_mono_preserve_looping(samples: &[i16], samples_looped: &[i16], sr
     // Resample both segments separately
     let looped_segment_dest_sample_rate;
     let resampled_len_preview = resample_len_preview(src_sample_rate, dest_sample_rate, samples_looped_extended.len());
-    if resampled_len_preview >= 9 { // Minimum for these calculations to work
-        fn get_sample_rate(desired_out_len: usize, src_sample_rate: f64, samples_looped: &[i16]) -> f64 {
-            // The subtraction by 1.51 is to deal with the `ceil` in the original max_len calculation found inside r8brain
-            (desired_out_len as f64 - 1.51) * (src_sample_rate / samples_looped.len() as f64)
-        }
-        let choice_1_desired_out_len = ((resampled_len_preview - 1) | 7) + 1;
-        let choice_1 = get_sample_rate(choice_1_desired_out_len, src_sample_rate, &samples_looped_extended);
-        let choice_2_desired_out_len = ((resampled_len_preview - 1 - 8) | 7) + 1;
-        let choice_2 = get_sample_rate(choice_2_desired_out_len, src_sample_rate, &samples_looped_extended);
-        println!("C1 DESIRED OUT LEN: {} LOOPED SMPLRATE: {} LENGTH VERIFY: {}", choice_1_desired_out_len, choice_1, resample_len_preview(src_sample_rate, choice_1, samples_looped_extended.len()));
-        println!("C2 DESIRED OUT LEN: {} LOOPED SMPLRATE: {} LENGTH VERIFY: {}", choice_2_desired_out_len, choice_2, resample_len_preview(src_sample_rate, choice_2, samples_looped_extended.len()));
-        assert!(choice_1_desired_out_len == resample_len_preview(src_sample_rate, choice_1, samples_looped_extended.len()));
-        assert!(choice_2_desired_out_len == resample_len_preview(src_sample_rate, choice_2, samples_looped_extended.len()));
-        looped_segment_dest_sample_rate = match sample_rate_choice_preference {
-            SampleRateChoicePreference::Higher => choice_1,
-            SampleRateChoicePreference::Lower => choice_2,
-            SampleRateChoicePreference::Nearest => if (choice_1 - dest_sample_rate).abs() <= (choice_2 - dest_sample_rate).abs() {
-                choice_1
-            } else {
-                choice_2
-            }
-        };
-    } else {
+    let choices_for_desired_out_len = block_alignment.generate_aligned_options(resampled_len_preview);
+    let choices: Vec<f64> = choices_for_desired_out_len.iter().map(|x| get_sample_rate_by_out_samples(src_sample_rate, samples_looped_extended.len(), *x)).collect();
+    if choices.is_empty() {
         looped_segment_dest_sample_rate = dest_sample_rate;
+    } else {
+        for (i, (&choice_for_desired_out_len, &choice)) in choices_for_desired_out_len.iter().zip(choices.iter()).enumerate() {
+            println!("C{} DESIRED OUT LEN: {} LOOPED SMPLRATE: {} LENGTH VERIFY: {}", i, choice_for_desired_out_len, choice, resample_len_preview(src_sample_rate, choice, samples_looped_extended.len()));
+            assert!(choice_for_desired_out_len == resample_len_preview(src_sample_rate, choice, samples_looped_extended.len()));
+        }
+        looped_segment_dest_sample_rate = match sample_rate_choice_preference {
+            SampleRateChoicePreference::Higher => *choices.iter().max_by(|a, b| a.total_cmp(b)).unwrap(), // Safe, already checked for emptiness before.
+            SampleRateChoicePreference::Lower => *choices.iter().min_by(|a, b| a.total_cmp(b)).unwrap(),
+            SampleRateChoicePreference::Nearest => choices.iter().map(|&x| (x, (x - dest_sample_rate).abs())).min_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0,
+            SampleRateChoicePreference::MinStartPad => choices.iter().map(|&x| (x, {
+                // Calculate the length of the pad necessary for this sample rate.
+                let resampled_len_preview = resample_len_preview(src_sample_rate, x, samples.len());
+                block_alignment.zero_pad_front(resampled_len_preview)
+            })).min_by(|a, b| a.1.cmp(&b.1)).unwrap().0
+        };
     }
 
     let (mut samples, _) = resample_mono_16bitpcm(samples, src_sample_rate, looped_segment_dest_sample_rate, &[]);
@@ -114,20 +152,41 @@ pub fn process_mono_preserve_looping(samples: &[i16], samples_looped: &[i16], sr
         v.resize(v.len() + n, x);
         v.rotate_right(n);
     }
-    let zero_pad_front = (8 - (samples.len() % 8)) % 8;
+    let zero_pad_front = block_alignment.zero_pad_front(samples.len());
     prepend(&mut samples, 0, zero_pad_front);
 
     // Combine the two segments, taking note of where the loop positions have moved to
     let loop_start_in_sample_points = samples.len(); // The first sample in the loop is the sample right next to the last sample in the `samples` segment
-    let loop_end_in_sample_points = samples.len() + samples_looped.len() - 1; // The last sample in the loop
+    let loop_end_in_sample_points = samples.len() + samples_looped.len() - 1; // Inclusive range end for the loop.
     samples.extend(samples_looped); // Concat
 
     // Encode ADPCM
-    let (resampled, tracking) = encode_adpcm_mono_16bitpcm(&samples, lookahead, samples_per_block, &[loop_start_in_sample_points, loop_end_in_sample_points]);
+    let (resampled, tracking) = adpcm_encode_mono_16bitpcm(&samples, lookahead, calc_initial_deltas, samples_per_block, &[loop_start_in_sample_points, loop_end_in_sample_points]);
     (resampled, looped_segment_dest_sample_rate, tracking)
 }
 
-pub fn encode_adpcm_mono_16bitpcm(samples: &[i16], lookahead: c_int, samples_per_block: Option<usize>, track_sample_points: &[usize]) -> (Vec<u8>, Result<Vec<usize>, TrackingError>) {
+pub mod init_deltas {
+    pub fn averaging(samples: &[i16]) -> i32 {
+        let mut average_delta: i32 = 0;
+        for i in (samples.len()-1)..0 {
+            average_delta -= average_delta / 8;
+            average_delta += (samples[i] as i32 - samples[i-1] as i32).abs();
+        }
+        average_delta /= 8;
+        average_delta
+    }
+}
+
+pub fn adpcm_encode_round_to_valid_block_size(preferred_samples_per_block: usize) -> usize {
+    ((preferred_samples_per_block - 2) | 7) + 2
+}
+pub fn adpcm_block_size_preview(pcm_block_size: usize) -> usize {
+    (pcm_block_size - 1) / 2 + 4
+}
+
+pub fn adpcm_encode_mono_16bitpcm<InitDeltas>(samples: &[i16], lookahead: c_int, calc_initial_deltas: InitDeltas, samples_per_block: Option<usize>, track_sample_points: &[usize]) -> (Vec<u8>, Result<Vec<usize>, TrackingError>)
+where
+    InitDeltas: FnOnce(&[i16]) -> i32 {
     let mut tracked_to: Vec<Result<usize, TrackingError>> = vec![Err(TrackingError {  }); track_sample_points.len()];
     
     let preferred_samples_per_block;
@@ -139,15 +198,10 @@ pub fn encode_adpcm_mono_16bitpcm(samples: &[i16], lookahead: c_int, samples_per
     let samples_per_block = ((preferred_samples_per_block - 2) | 7) + 2;
 
     // Encode samples with ADPCM
-    let mut average_delta: i32 = 0;
-    for i in (samples.len()-1)..0 {
-        average_delta -= average_delta / 8;
-        average_delta += (samples[i] as i32 - samples[i-1] as i32).abs();
-    }
-    average_delta /= 8;
+    let mut initial_deltas = calc_initial_deltas(samples);
     let mut samples_adpcm: Vec<u8> = Vec::new();
     unsafe {
-        let adpcmctx = adpcm_create_context(1, lookahead, 2, &mut average_delta as *mut i32);
+        let adpcmctx = adpcm_create_context(1, lookahead, 2, &mut initial_deltas as *mut i32);
         {
             let mut block_size = (samples_per_block - 1) / 2 + 4;
             let block_size_static = block_size;
@@ -193,7 +247,11 @@ pub fn encode_adpcm_mono_16bitpcm(samples: &[i16], lookahead: c_int, samples_per
                     if *tracked >= i * samples_per_block && *tracked < (i+1) * samples_per_block {
                         // If it does, the tracked index is within this chunk as well but its index would've been changed by the encoding process. Recalculate the new index and return it later
                         let index_in_this_chunk = *tracked - i * samples_per_block;
-                        *tracked_to = Ok(i * block_size_static + 4 + index_in_this_chunk / 2);
+                        if index_in_this_chunk == 0 {
+                            *tracked_to = Ok(i * block_size_static);
+                        } else {
+                            *tracked_to = Ok(i * block_size_static + 4 + (index_in_this_chunk-1) / 2);
+                        }
                     }
                 }
             }
@@ -212,14 +270,10 @@ pub fn resample_len_preview(src_sample_rate: f64, dest_sample_rate: f64, n_sampl
 }
 
 pub fn resample_mono_16bitpcm(samples: &[i16], src_sample_rate: f64, dest_sample_rate: f64, track_sample_points: &[usize]) -> (Vec<i16>, Vec<usize>) {
-    // Map the tracked indices to the new sample rate
-    let tracked_sample_points: Vec<usize> = track_sample_points.iter().map(|&x| {
-        let mut tracked = (x as f64 * (dest_sample_rate / src_sample_rate)).round() as usize;
-        if tracked >= samples.len() {
-            tracked = samples.len()-1;
-        }
-        tracked
-    }).collect();
+    // Map the tracked indices to the new sample rate.
+    // This particular method of doing so maps 0 to 0 and in_samples_len to out_samples_len.
+    let len_ratio = resample_len_preview(src_sample_rate, dest_sample_rate, samples.len()) as f64 / samples.len() as f64;
+    let tracked_sample_points: Vec<usize> = track_sample_points.iter().map(|&x| (x as f64 * len_ratio).round() as usize).collect();
 
     let mut samples_processed: Vec<i16>;
     if !samples.is_empty() {
