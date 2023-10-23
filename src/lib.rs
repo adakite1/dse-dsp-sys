@@ -268,6 +268,10 @@ pub fn resample_len_preview(src_sample_rate: f64, dest_sample_rate: f64, n_sampl
         resampler16_getMaxOutLen(resampler16, n_samples as i32) as usize
     }
 }
+pub fn resample_pos_preview(src_sample_rate: f64, dest_sample_rate: f64, n_samples_original: usize, x: usize) -> usize {
+    let len_ratio = resample_len_preview(src_sample_rate, dest_sample_rate, n_samples_original) as f64 / n_samples_original as f64;
+    (x as f64 * len_ratio).round() as usize
+}
 
 pub fn resample_mono_16bitpcm(samples: &[i16], src_sample_rate: f64, dest_sample_rate: f64, track_sample_points: &[usize]) -> (Vec<i16>, Vec<usize>) {
     // Map the tracked indices to the new sample rate.
