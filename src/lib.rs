@@ -10,7 +10,7 @@ use tracing::{debug, error, span, trace, Level};
 pub struct HCDSPResampler16 {
     _unused: [u8; 0]
 }
-extern "C" {
+unsafe extern "C" {
     pub fn resampler16_create(SrcSampleRate: c_double, DstSampleRate: c_double, aMaxInLen: c_int, ReqTransBand: c_double ) -> *mut HCDSPResampler16;
     pub fn resampler16_destroy(resampler16: *mut HCDSPResampler16);
     pub fn resampler16_clear(resampler16: *mut HCDSPResampler16);
