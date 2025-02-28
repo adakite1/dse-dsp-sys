@@ -1,4 +1,4 @@
-use std::{ffi::{c_double, c_int}, ptr::null_mut};
+use std::{ffi::{c_double, c_int}, fmt::Debug, ptr::null_mut};
 
 use adpcm_xq_sys::{adpcm_create_context, adpcm_encode_block, adpcm_free_context};
 use block_alignment::BlockAlignment;
@@ -49,14 +49,67 @@ impl std::fmt::Display for TrackingError {
     }
 }
 
-/// Resample and ADPCM encode mono and 16-bit PCM samples.
-pub fn process_mono_16bitpcm<InitDeltas>(samples: &[i16], src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, calc_initial_deltas: InitDeltas, preferred_samples_per_block: Option<usize>, track_sample_points: &[usize]) -> (Vec<u8>, Result<Vec<usize>, TrackingError>)
+pub fn separate_interleaved_channels<S, I>(samples: I, num_channels: usize, switch_every: usize) -> Vec<Vec<S>>
 where
-    InitDeltas: FnOnce(&[i16]) -> i32 {
-    let _span_ = span!(Level::DEBUG, "process_mono_16bitpcm", num_samples = samples.len(), src_sample_rate, dest_sample_rate, lookahead, ?preferred_samples_per_block, ?track_sample_points).entered();
-    let (samples, tracked_sample_points) = resample_mono_16bitpcm(samples, src_sample_rate, dest_sample_rate, track_sample_points);
-    debug!(num_samples_new = samples.len(), "Resampling done");
-    adpcm_encode_mono_16bitpcm(&samples, lookahead, calc_initial_deltas, preferred_samples_per_block, &tracked_sample_points)
+    S: Clone,
+    I: IntoIterator<Item = S>,
+    I::IntoIter: ExactSizeIterator {
+    let mut iter = samples.into_iter();
+    let iter_len = iter.len();
+    let _span_ = span!(Level::DEBUG, "separate_interleaved_channels", num_individual_samples = iter_len, num_channels, switch_every).entered();
+
+    if iter_len % switch_every != 0 {
+        error!(num_individual_samples = iter_len, switch_every, modulo = iter_len % switch_every, "Provided samples do not divide evenly into the `switch_every` specified!");
+        panic!("Provided samples do not divide evenly into the `switch_every` specified!");
+    }
+
+    let units = iter_len / switch_every;
+
+    if units % num_channels != 0 {
+        error!(num_units = units, num_channels, modulo = units % num_channels, "Provided samples, once divided into units according to `switch_every`, do not divide evenly into the number of channels specified!");
+        panic!("Provided samples, once divided into units according to `switch_every`, do not divide evenly into the number of channels specified!");
+    }
+
+    let mut channels: Vec<Vec<S>> = vec![Vec::with_capacity(iter_len / num_channels); num_channels];
+    for i in 0..iter_len {
+        channels[(i / switch_every) % num_channels].push(iter.next().unwrap());
+    }
+
+    channels
+}
+
+/// Resample and ADPCM encode 16-bit PCM samples.
+pub fn process_16bitpcm(samples: &[&[i16]], src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, noise_shaping: c_int, preferred_samples_per_block: Option<usize>) -> (Vec<u8>, usize) {
+    let _span_ = span!(Level::DEBUG, "process_16bitpcm", src_sample_rate, dest_sample_rate, lookahead, noise_shaping, ?preferred_samples_per_block).entered();
+
+    let num_channels = samples.len();
+    if num_channels == 0 {
+        error!(num_channels, "`samples` must have at least one channel of audio!");
+        panic!("`samples` must have at least one channel of audio!");
+    }
+    let num_samples = samples[0].len();
+    if samples.iter().skip(1).any(|channel| channel.len() != num_samples) {
+        error!(sample_counts = ?samples.iter().map(|channel| channel.len()).collect::<Vec<usize>>(), "All channels must contain the same number of samples!");
+        panic!("All channels must contain the same number of samples!");
+    }
+
+    debug!(num_channels, num_samples, "Audio source");
+
+    let samples: Vec<Vec<i16>> = samples.iter().map(|channel| resample_mono_16bitpcm(&channel, src_sample_rate, dest_sample_rate)).collect();
+    let num_samples = samples[0].len();
+
+    debug!(num_samples_new = num_samples, "Resampling done");
+
+    // Interleave the channels
+    let mut samples_interleaved: Vec<i16> = Vec::with_capacity(num_samples * num_channels);
+    for i in 0..num_samples {
+        for channel in &samples {
+            samples_interleaved.push(channel[i]);
+        }
+    }
+
+    debug!(num_channels, sample_rate = dest_sample_rate, lookahead, noise_shaping, ?preferred_samples_per_block, "Started ADPCM encoding...");
+    adpcm_encode_16bitpcm(&samples_interleaved, num_channels, dest_sample_rate as i32, lookahead, noise_shaping, preferred_samples_per_block)
 }
 
 /// A collection of block alignment targets.
@@ -108,15 +161,32 @@ pub fn get_sample_rate_by_out_samples(src_sample_rate: f64, n_samples: usize, n_
     // The subtraction by 1.51 is to deal with the `ceil` in the original max_len calculation found inside r8brain
     (n_samples_target as f64 - 1.51) * (src_sample_rate / n_samples as f64)
 }
-/// Resample and ADPCM encode mono and 16-bit PCM samples, preserving looping by processing the non-looped and looped segments separately.
+/// Resample and ADPCM encode 16-bit PCM samples, preserving looping by processing the non-looped and looped segments separately.
 /// 
 /// The `min_loop_len` specifies the target number of samples to extend the looped segment to. In practice the resulting looped segment will likely be larger than the specified minimum. A value of zero, the minimum, will always guarantee that the looped samples are processed as is, without any repetitions.
-pub fn process_mono_16bitpcm_preserve_looping<InitDeltas, A>(samples: &[i16], samples_looped: &[i16], src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, calc_initial_deltas: InitDeltas, min_loop_len: usize, block_alignment: A, sample_rate_choice_preference: SampleRateChoicePreference, preferred_samples_per_block: Option<usize>) -> (Vec<u8>, f64, Result<Vec<usize>, TrackingError>)
+pub fn process_16bitpcm_preserve_looping<A>(samples: &[&[i16]], samples_looped: &[&[i16]], src_sample_rate: f64, dest_sample_rate: f64, lookahead: c_int, noise_shaping: c_int, min_loop_len: usize, block_alignment: A, sample_rate_choice_preference: SampleRateChoicePreference, preferred_samples_per_block: Option<usize>) -> (Vec<u8>, f64, usize)
 where
-    InitDeltas: FnOnce(&[i16]) -> i32,
     A: BlockAlignment {
-    let _span_ = span!(Level::DEBUG, "process_mono_16bitpcm_preserve_looping", num_samples = samples.len(), num_samples_looped = samples_looped.len(), src_sample_rate, dest_sample_rate, lookahead, min_loop_len, ?sample_rate_choice_preference, ?preferred_samples_per_block).entered();
-    
+    let _span_ = span!(Level::DEBUG, "process_16bitpcm_preserve_looping", src_sample_rate, dest_sample_rate, lookahead, noise_shaping, min_loop_len, ?sample_rate_choice_preference, ?preferred_samples_per_block).entered();
+
+    let num_channels = samples.len();
+    if num_channels == 0 || samples_looped.len() == 0 || num_channels != samples_looped.len() {
+        error!(num_channels, num_channels_looped = samples_looped.len(), "`samples` and `samples_looped` must have the same number of channels, and both should have at least one channel of audio!");
+        panic!("`samples` and `samples_looped` must have the same number of channels, and both should have at least one channel of audio!");
+    }
+    let num_samples = samples[0].len();
+    if samples.iter().skip(1).any(|channel| channel.len() != num_samples) {
+        error!(sample_counts = ?samples.iter().map(|channel| channel.len()).collect::<Vec<usize>>(), "All channels must contain the same number of samples!");
+        panic!("All channels must contain the same number of samples!");
+    }
+    let num_samples_looped = samples_looped[0].len();
+    if samples_looped.iter().skip(1).any(|channel| channel.len() != num_samples_looped) {
+        error!(sample_counts_looped = ?samples_looped.iter().map(|channel| channel.len()).collect::<Vec<usize>>(), "All channels must contain the same number of samples!");
+        panic!("All channels must contain the same number of samples!");
+    }
+
+    debug!(num_channels, num_samples, num_samples_looped, "Audio source");
+
     /// Calculate how many times to repeat the looped samples before resampling.
     /// 
     /// The `min_loop_len` specifies the target number of samples to extend the looped segment to. A value of zero, the minimum, will always guarantee that the looped samples are processed as is, without any repetitions.
@@ -134,15 +204,19 @@ where
         fac.round() as usize
     }
     // Extend the loop if it's too short
-    let samples_looped_extended: Vec<i16> = std::iter::repeat_with(|| samples_looped.iter().cloned())
-        .take(1 + repetition_factor(samples_looped.len(), src_sample_rate, dest_sample_rate, min_loop_len))
-        .flatten().collect();
+    let reps = repetition_factor(num_samples_looped, src_sample_rate, dest_sample_rate, min_loop_len);
+    let samples_looped_extended: Vec<Vec<i16>> = samples_looped.iter().map(|channel|
+        std::iter::repeat_with(|| channel.iter().cloned())
+            .take(1 + reps)
+            .flatten().collect()
+    ).collect();
+    let num_samples_looped_extended = samples_looped_extended[0].len();
     
     // Resample both segments separately
     let looped_segment_dest_sample_rate;
-    let resampled_len_preview = resample_len_preview(src_sample_rate, dest_sample_rate, samples_looped_extended.len());
+    let resampled_len_preview = resample_len_preview(src_sample_rate, dest_sample_rate, num_samples_looped_extended);
     let choices_for_desired_out_len = block_alignment.generate_aligned_options(resampled_len_preview);
-    let choices: Vec<f64> = choices_for_desired_out_len.iter().map(|x| get_sample_rate_by_out_samples(src_sample_rate, samples_looped_extended.len(), *x)).collect();
+    let choices: Vec<f64> = choices_for_desired_out_len.iter().map(|x| get_sample_rate_by_out_samples(src_sample_rate, num_samples_looped_extended, *x)).collect();
     if choices.is_empty() {
         looped_segment_dest_sample_rate = dest_sample_rate;
     } else {
@@ -150,8 +224,8 @@ where
         {
             let _span_verify_ = span!(Level::TRACE, "verify resample-rate candidates").entered();
             for (i, (&choice_for_desired_out_len, &choice)) in choices_for_desired_out_len.iter().zip(choices.iter()).enumerate() {
-                trace!(i, choice_for_desired_out_len, choice, length_verify = resample_len_preview(src_sample_rate, choice, samples_looped_extended.len()), "Candidate for desired output length");
-                assert!(choice_for_desired_out_len == resample_len_preview(src_sample_rate, choice, samples_looped_extended.len()));
+                trace!(i, choice_for_desired_out_len, choice, length_verify = resample_len_preview(src_sample_rate, choice, num_samples_looped_extended), "Candidate for desired output length");
+                assert!(choice_for_desired_out_len == resample_len_preview(src_sample_rate, choice, num_samples_looped_extended));
             }
         }
         looped_segment_dest_sample_rate = match sample_rate_choice_preference {
@@ -160,53 +234,54 @@ where
             SampleRateChoicePreference::Nearest => choices.iter().map(|&x| (x, (x - dest_sample_rate).abs())).min_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0,
             SampleRateChoicePreference::MinStartPad => choices.iter().map(|&x| (x, {
                 // Calculate the length of the pad necessary for this sample rate.
-                let resampled_len_preview = resample_len_preview(src_sample_rate, x, samples.len());
+                let resampled_len_preview = resample_len_preview(src_sample_rate, x, num_samples);
                 block_alignment.zero_pad_front(resampled_len_preview)
             })).min_by(|a, b| a.1.cmp(&b.1)).unwrap().0
         };
         trace!(chosen = looped_segment_dest_sample_rate, ?sample_rate_choice_preference, among = ?choices, "Sample rate chosen");
     }
 
-    let (mut samples, _) = resample_mono_16bitpcm(samples, src_sample_rate, looped_segment_dest_sample_rate, &[]);
-    let (samples_looped, _) = resample_mono_16bitpcm(&samples_looped_extended, src_sample_rate, looped_segment_dest_sample_rate, &[]);
-    
     /// Insert in-place a new element `x`, `n` times at the start of vector `v`.
     #[tracing::instrument(level = "trace")]
     fn prepend<T: Clone + std::fmt::Debug>(v: &mut Vec<T>, x: T, n: usize) {
         v.resize(v.len() + n, x);
         v.rotate_right(n);
     }
-    // Zero-pad the front so that the end of the `samples` segment align perfectly with the start of the `samples_looped` segment
-    let zero_pad_front = block_alignment.zero_pad_front(samples.len());
-    prepend(&mut samples, 0, zero_pad_front);
-    debug!(num_samples_new = samples.len(), zero_pad_front, num_samples_looped_new = samples_looped.len(), "Resampling done, non-looped segment might have been prepended with some zeroes");
 
-    // Combine the two segments, taking note of where the loop positions have moved to
-    let loop_start_in_sample_points = samples.len(); // The first sample in the loop is the sample right next to the last sample in the `samples` segment
-    let loop_end_in_sample_points = samples.len() + samples_looped.len() - 1; // Inclusive range end for the loop.
-    samples.extend(samples_looped); // Concat
-    debug!(loop_start_in_sample_points, loop_end_in_sample_points, "Loop positions after resampling and concatenating");
+    // Calculate the zero-pad at the front so that the end of the `samples` segment align perfectly with the start of the `samples_looped` segment
+    let zero_pad_front = block_alignment.zero_pad_front(num_samples);
+
+    let samples: Vec<Vec<i16>> = samples.iter().map(|channel| {
+        let mut resampled_channel = resample_mono_16bitpcm(&channel, src_sample_rate, looped_segment_dest_sample_rate);
+        prepend(&mut resampled_channel, 0, zero_pad_front);
+        resampled_channel
+    }).collect();
+    let samples_looped: Vec<Vec<i16>> = samples_looped_extended.iter().map(|channel| resample_mono_16bitpcm(&channel, src_sample_rate, looped_segment_dest_sample_rate)).collect();
+    
+    // Update num_samples
+    let num_samples = samples[0].len();
+    let num_samples_looped = samples_looped[0].len();
+    
+    debug!(num_samples_new = num_samples, zero_pad_front, num_samples_looped_new = num_samples_looped, "Resampling done, non-looped segment might have been prepended with some zeroes");
+
+    // Combine the two segments and interleave the channels
+    let mut samples_interleaved: Vec<i16> = Vec::with_capacity((num_samples + num_samples_looped) * num_channels);
+    for i in 0..num_samples {
+        for channel in &samples {
+            samples_interleaved.push(channel[i]);
+        }
+    }
+    for i in 0..num_samples_looped {
+        for channel in &samples_looped {
+            samples_interleaved.push(channel[i]);
+        }
+    }
 
     // Encode ADPCM
-    let (resampled, tracking) = adpcm_encode_mono_16bitpcm(&samples, lookahead, calc_initial_deltas, preferred_samples_per_block, &[loop_start_in_sample_points, loop_end_in_sample_points]);
-    debug!(size_in_bytes = resampled.len(), sample_rate = looped_segment_dest_sample_rate, "ADPCM encoding done");
-    debug!(?tracking, "Final loop positions");
-    (resampled, looped_segment_dest_sample_rate, tracking)
-}
-
-/// A collection of choices of algorithms for calculating the initial ADPCM deltas.
-pub mod init_deltas {
-    /// Calculate initial ADPCM deltas using averaging.
-    #[tracing::instrument(level = "trace")]
-    pub fn averaging(samples: &[i16]) -> i32 {
-        let mut average_delta: i32 = 0;
-        for i in (samples.len()-1)..0 {
-            average_delta -= average_delta / 8;
-            average_delta += (samples[i] as i32 - samples[i-1] as i32).abs();
-        }
-        average_delta /= 8;
-        average_delta
-    }
+    debug!(num_channels, sample_rate = looped_segment_dest_sample_rate, lookahead, noise_shaping, ?preferred_samples_per_block, "Started ADPCM encoding...");
+    let (encoded_interleaved, samples_per_block) = adpcm_encode_16bitpcm(&samples_interleaved, num_channels, looped_segment_dest_sample_rate as c_int, lookahead, noise_shaping, preferred_samples_per_block);
+    
+    (encoded_interleaved, looped_segment_dest_sample_rate, samples_per_block)
 }
 
 /// Round the provided samples per block to a valid ADPCM block size.
@@ -222,49 +297,73 @@ pub fn adpcm_block_size_in_bytes_preview(num_samples: usize) -> usize {
     (num_samples - 1) / 2 + 4
 }
 
-/// ADPCM encode mono and 16-bit PCM samples with the provided configurations, while tracking a series of sample points to where they land in the encoded audio.
+/// Calculate the byte offsets where the provided sample point indexes in the original audio will land after ADPCM encoding, given the encoding parameters.
+#[tracing::instrument(level = "trace")]
+pub fn adpcm_encode_16bitpcm_byte_pos_preview_batch(samples_per_block: usize, num_channels: usize, track_sample_points: &[usize]) -> Vec<usize> {
+    track_sample_points.iter().map(|&x| {
+        let base = (x / samples_per_block) * (((samples_per_block - 1) / 2 + 4) * num_channels);
+        let index_in_this_chunk = x % samples_per_block;
+        if index_in_this_chunk == 0 {
+            base
+        } else {
+            base + (4 + (index_in_this_chunk - 1) / 2) * num_channels
+        }
+    }).collect()
+}
+
+pub use adpcm_xq_sys::NOISE_SHAPING_OFF;
+pub use adpcm_xq_sys::NOISE_SHAPING_STATIC;
+pub use adpcm_xq_sys::NOISE_SHAPING_DYNAMIC;
+
+pub use adpcm_xq_sys::LOOKAHEAD_DEPTH;
+pub use adpcm_xq_sys::LOOKAHEAD_EXHAUSTIVE;
+pub use adpcm_xq_sys::LOOKAHEAD_NO_BRANCHING;
+
+/// ADPCM encode 16-bit PCM samples with the provided configurations, while tracking a series of sample points to where they land in the encoded audio.
 /// 
 /// The `preferred_samples_per_block` provided will be aligned to a valid ADPCM block size automatically, and the aligned value will be used instead.
-pub fn adpcm_encode_mono_16bitpcm<InitDeltas>(samples: &[i16], lookahead: c_int, calc_initial_deltas: InitDeltas, preferred_samples_per_block: Option<usize>, track_sample_points: &[usize]) -> (Vec<u8>, Result<Vec<usize>, TrackingError>)
-where
-    InitDeltas: FnOnce(&[i16]) -> i32 {
-    let _span_ = span!(Level::DEBUG, "adpcm_encode_mono_16bitpcm", num_samples = samples.len(), lookahead, preferred_samples_per_block, ?track_sample_points).entered();
+pub fn adpcm_encode_16bitpcm(samples: &[i16], num_channels: usize, sample_rate: c_int, lookahead: c_int, noise_shaping: c_int, preferred_samples_per_block: Option<usize>) -> (Vec<u8>, usize) {
+    let _span_ = span!(Level::DEBUG, "adpcm_encode_16bitpcm", num_individual_samples = samples.len(), num_channels, sample_rate, lookahead, noise_shaping, ?preferred_samples_per_block).entered();
 
-    let mut tracked_to: Vec<Result<usize, TrackingError>> = vec![Err(TrackingError {  }); track_sample_points.len()];
-    
-    let samples_per_block = ((preferred_samples_per_block.unwrap_or(samples.len()) - 2) | 7) + 2;
+    let num_samples = samples.len() / num_channels;
+    let samples_per_block = ((preferred_samples_per_block.unwrap_or(num_samples) - 2) | 7) + 2;
+
+    if samples.len() == 0 {
+        return (Vec::new(), samples_per_block);
+    }
+    if samples.len() % num_channels != 0 {
+        error!(num_individual_samples = samples.len(), num_channels, modulo = samples.len() % num_channels, "Provided samples do not divide evenly into the number of channels specified!");
+        panic!("Provided samples do not divide evenly into the number of channels specified!");
+    }
+
+    debug!(num_channels, num_samples, "Audio source");
 
     // Encode samples with ADPCM
-    debug!("Calculating initial ADPCM deltas...");
-    let mut initial_deltas = calc_initial_deltas(samples);
-    debug!(initial_deltas, "Initial ADPCM deltas");
     let mut samples_adpcm: Vec<u8> = Vec::new();
     unsafe {
-        let adpcmctx = adpcm_create_context(1, lookahead, 2, &mut initial_deltas as *mut i32);
-        debug!(adpcmctx = adpcmctx as usize, lookahead, noise_shaping = 2, initial_deltas = &mut initial_deltas as *mut i32 as usize, "Created ADPCM encoding context");
+        let adpcmctx = adpcm_create_context(num_channels as c_int, sample_rate, lookahead, noise_shaping);
+        debug!(adpcmctx = adpcmctx as usize, num_channels, sample_rate, lookahead, noise_shaping, "Created ADPCM encoding context");
         {
-            let mut block_size_in_bytes = (samples_per_block - 1) / 2 + 4;
-            let block_size_in_bytes_static = block_size_in_bytes;
+            let mut block_size_in_bytes = ((samples_per_block - 1) / 2 + 4) * num_channels;
             let _span_loop_ = span!(Level::TRACE, "adpcm chunks encoding loop").entered();
-            for (i, chunk) in samples.chunks(samples_per_block).into_iter().enumerate() {
+            for chunk in samples.chunks(samples_per_block * num_channels).into_iter() {
                 let mut this_block_adpcm_samples = samples_per_block; // For when the file doesn't end on a full block, extra configuration is needed
-                let mut this_block_pcm_samples = samples_per_block;
+                let this_block_pcm_samples = chunk.len() / num_channels;
 
                 // If the last chunk is not full, the chunk needs to be filled to the next valid ADPCM-encoder input block size
-                if this_block_pcm_samples > chunk.len() {
-                    this_block_adpcm_samples = ((chunk.len() - 2) | 7) + 2; // Round the chunk's length up to the next valid ADPCM-encoder input block size
-                    trace!(final_block_num_samples_original = this_block_pcm_samples, final_block_num_samples_new = this_block_adpcm_samples, block_size_in_bytes_original = block_size_in_bytes, block_size_in_bytes_new = (this_block_adpcm_samples - 1) / 2 + 4, "Final chunk does not fill the full normal block so will be padded to the closest valid ADPCM sample count");
-                    block_size_in_bytes = (this_block_adpcm_samples - 1) / 2 + 4;
-                    this_block_pcm_samples = chunk.len();
+                if samples_per_block > this_block_pcm_samples {
+                    this_block_adpcm_samples = ((this_block_pcm_samples - 2) | 7) + 2; // Round the chunk's length up to the next valid ADPCM-encoder input block size
+                    trace!(final_block_num_samples_original = this_block_pcm_samples, final_block_num_samples_new = this_block_adpcm_samples, block_size_in_bytes_original = block_size_in_bytes, block_size_in_bytes_new = ((this_block_adpcm_samples - 1) / 2 + 4) * num_channels, "Final chunk does not fill the full normal block so will be padded to the closest valid ADPCM sample count");
+                    block_size_in_bytes = ((this_block_adpcm_samples - 1) / 2 + 4) * num_channels;
                 }
                 let mut padded_chunk_src;
                 let padded_chunk;
                 if this_block_adpcm_samples > this_block_pcm_samples {
-                    let last_sample = chunk[chunk.len()-1];
+                    let last_samples = &chunk[(chunk.len()-num_channels)..];
                     padded_chunk_src = Vec::from(chunk);
                     let dups = this_block_adpcm_samples - this_block_pcm_samples;
                     for _ in 0..dups {
-                        padded_chunk_src.push(last_sample.clone());
+                        padded_chunk_src.extend_from_slice(last_samples);
                     }
                     trace!(dups, "Padded chunk");
                     padded_chunk = &padded_chunk_src[..];
@@ -276,7 +375,7 @@ where
                 let mut adpcm_block: Vec<u8> = vec![0; block_size_in_bytes];
                 let mut outbufsize: usize = 0;
                 // Do the encoding
-                adpcm_encode_block(adpcmctx, adpcm_block.as_mut_ptr(), &mut outbufsize as *mut usize, padded_chunk.as_ptr(), padded_chunk.len() as i32);
+                adpcm_encode_block(adpcmctx, adpcm_block.as_mut_ptr(), &mut outbufsize as *mut usize, padded_chunk.as_ptr(), this_block_adpcm_samples as i32);
 
                 if outbufsize != block_size_in_bytes {
                     error!(expected = block_size_in_bytes, got = outbufsize, "Unexpected number of bytes written in ADPCM encoded output");
@@ -285,28 +384,13 @@ where
 
                 // Do something with the adpcm_block
                 samples_adpcm.extend_from_slice(&adpcm_block);
-
-                // See if any of the tracked indices belong to this chunk
-                for (tracked, tracked_to) in track_sample_points.iter().zip(tracked_to.iter_mut()) {
-                    if *tracked >= i * samples_per_block && *tracked < (i+1) * samples_per_block {
-                        // If it does, the tracked index is within this chunk as well but its index would've been changed by the encoding process. Recalculate the new index and return it later
-                        let index_in_this_chunk = *tracked - i * samples_per_block;
-                        if index_in_this_chunk == 0 {
-                            trace!(byte_position = i * block_size_in_bytes_static, chunk = i, index_in_this_chunk, "Tracked sample to ADPCM output block");
-                            *tracked_to = Ok(i * block_size_in_bytes_static);
-                        } else {
-                            trace!(byte_position = i * block_size_in_bytes_static + 4 + (index_in_this_chunk-1) / 2, chunk = i, index_in_this_chunk, "Tracked sample to ADPCM output block");
-                            *tracked_to = Ok(i * block_size_in_bytes_static + 4 + (index_in_this_chunk-1) / 2);
-                        }
-                    }
-                }
             }
         }
         debug!("Destroying ADPCM encoding context...");
         adpcm_free_context(adpcmctx);
     }
 
-    (samples_adpcm, tracked_to.into_iter().collect::<Result<Vec<usize>, TrackingError>>())
+    (samples_adpcm, samples_per_block)
 }
 
 /// Calculate the maximum number of samples that will be outputted after resampling, given the resampling parameters.
@@ -324,16 +408,21 @@ pub fn resample_pos_preview(src_sample_rate: f64, dest_sample_rate: f64, n_sampl
     let len_ratio = resample_len_preview(src_sample_rate, dest_sample_rate, n_samples_original) as f64 / n_samples_original as f64;
     (x as f64 * len_ratio).round() as usize
 }
-
-/// Resample mono and 16-bit PCM samples to the specified destination sample rate, while tracking a series of sample points to where they land in the resampled audio.
-#[tracing::instrument(level = "debug")]
-pub fn resample_mono_16bitpcm(samples: &[i16], src_sample_rate: f64, dest_sample_rate: f64, track_sample_points: &[usize]) -> (Vec<i16>, Vec<usize>) {
+/// Calculate the positions where the provided sample point indexes in the original audio will land after resampling, given the resampling parameters.
+#[tracing::instrument(level = "trace")]
+pub fn resample_pos_preview_batch(src_sample_rate: f64, dest_sample_rate: f64, n_samples_original: usize, track_sample_points: &[usize]) -> Vec<usize> {
     // Map the tracked indices to the new sample rate.
     // This particular method of doing so maps 0 to 0 and in_samples_len to out_samples_len.
-    let len_ratio = resample_len_preview(src_sample_rate, dest_sample_rate, samples.len()) as f64 / samples.len() as f64;
+    let len_ratio = resample_len_preview(src_sample_rate, dest_sample_rate, n_samples_original) as f64 / n_samples_original as f64;
     let tracked_sample_points: Vec<usize> = track_sample_points.iter().map(|&x| (x as f64 * len_ratio).round() as usize).collect();
-    debug!(from = ?track_sample_points, to = ?tracked_sample_points, "New positions of tracked sample points calculated");
+    // trace!(from = ?track_sample_points, to = ?tracked_sample_points, "New positions of tracked sample points calculated");
+    tracked_sample_points
+}
 
+/// Resample mono and 16-bit PCM samples to the specified destination sample rate, while tracking a series of sample points to where they land in the resampled audio.
+pub fn resample_mono_16bitpcm(samples: &[i16], src_sample_rate: f64, dest_sample_rate: f64) -> Vec<i16> {
+    let _span_ = span!(Level::DEBUG, "resample_mono_16bitpcm", num_samples = samples.len(), src_sample_rate, dest_sample_rate).entered();
+    
     let mut samples_processed: Vec<i16>;
     if !samples.is_empty() {
         // Resampler expects floating point samples. Convert.
@@ -373,5 +462,5 @@ pub fn resample_mono_16bitpcm(samples: &[i16], src_sample_rate: f64, dest_sample
         samples_processed = Vec::new();
     }
 
-    (samples_processed, tracked_sample_points)
+    samples_processed
 }
